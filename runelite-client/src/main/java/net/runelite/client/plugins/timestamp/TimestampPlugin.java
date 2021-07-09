@@ -27,14 +27,19 @@ package net.runelite.client.plugins.timestamp;
 
 import com.google.inject.Provides;
 import java.awt.Color;
+import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
-import java.time.temporal.ChronoField;
+import java.util.Date;
 import javax.inject.Inject;
+import lombok.Getter;
 import net.runelite.api.Client;
 import net.runelite.api.MessageNode;
+import net.runelite.api.ScriptID;
 import net.runelite.api.Varbits;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -56,45 +61,92 @@ public class TimestampPlugin extends Plugin
 	@Inject
 	private TimestampConfig config;
 
+	@Getter
+	private SimpleDateFormat formatter;
+
+	private MessageNode currentlyBuildingMessage = null;
+
 	@Provides
 	public TimestampConfig provideConfig(final ConfigManager configManager)
 	{
 		return configManager.getConfig(TimestampConfig.class);
 	}
 
-	@Subscribe
-	public void onScriptCallbackEvent(ScriptCallbackEvent event)
+	@Override
+	protected void startUp() throws Exception
 	{
-		if (!event.getEventName().equals("addTimestamp"))
+		updateFormatter();
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		formatter = null;
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals("timestamp") && event.getKey().equals("format"))
+		{
+			updateFormatter();
+		}
+	}
+
+	@Subscribe
+	private void onScriptCallbackEvent(ScriptCallbackEvent event)
+	{
+		if (!"chatMessageBuilding".equals(event.getEventName()))
 		{
 			return;
 		}
 
-		int[] intStack = client.getIntStack();
-		int intStackSize = client.getIntStackSize();
+		int uid = client.getIntStack()[client.getIntStackSize() - 1];
+		currentlyBuildingMessage = client.getMessages().get(uid);
+	}
+
+	@Subscribe
+	private void onScriptPreFired(ScriptPreFired ev)
+	{
+		int numStringArgs;
+		int messagePrefixArg = 0;
+		switch (ev.getScriptId())
+		{
+			case ScriptID.CHATBOX_BUILD_LINE_WITHOUT_USER:
+				numStringArgs = 1;
+				break;
+			case ScriptID.CHATBOX_BUILD_LINE_WITH_USER:
+				numStringArgs = 2;
+				break;
+			case ScriptID.CHATBOX_BUILD_LINE_WITH_CLAN:
+				numStringArgs = 3;
+				break;
+			default:
+				return;
+		}
+
+		if (currentlyBuildingMessage == null)
+		{
+			return;
+		}
+
+		MessageNode messageNode = currentlyBuildingMessage;
+		currentlyBuildingMessage = null;
 
 		String[] stringStack = client.getStringStack();
-		int stringStackSize = client.getStringStackSize();
+		int stringArgStart = client.getStringStackSize() - numStringArgs;
 
-		int messageId = intStack[intStackSize - 1];
-
-		MessageNode messageNode = (MessageNode) client.getMessages().get(messageId);
-
-		final ZonedDateTime time = ZonedDateTime.ofInstant(
-			Instant.ofEpochSecond(messageNode.getTimestamp()), ZoneId.systemDefault());
-
-		final String dateFormat = time.get(ChronoField.HOUR_OF_DAY) + ":" +
-			String.format("%02d", time.get(ChronoField.MINUTE_OF_HOUR));
-
-		String timestamp = "[" + dateFormat + "] ";
-
+		String timestamp = generateTimestamp(messageNode.getTimestamp(), ZoneId.systemDefault()) + " ";
+		
 		Color timestampColour = getTimestampColour();
 		if (timestampColour != null)
 		{
 			timestamp = ColorUtil.wrapWithColorTag(timestamp, timestampColour);
 		}
-
-		stringStack[stringStackSize - 1] = timestamp;
+		
+		String segment = stringStack[stringArgStart + messagePrefixArg];
+		segment = timestamp + segment;
+		stringStack[stringArgStart + messagePrefixArg] = segment;
 	}
 
 	private Color getTimestampColour()
@@ -102,5 +154,25 @@ public class TimestampPlugin extends Plugin
 		boolean isChatboxTransparent = client.isResized() && client.getVar(Varbits.TRANSPARENT_CHATBOX) == 1;
 
 		return isChatboxTransparent ? config.transparentTimestamp() : config.opaqueTimestamp();
+	}
+
+	String generateTimestamp(int timestamp, ZoneId zoneId)
+	{
+		final ZonedDateTime time = ZonedDateTime.ofInstant(
+			Instant.ofEpochSecond(timestamp), zoneId);
+
+		return formatter.format(Date.from(time.toInstant()));
+	}
+
+	private void updateFormatter()
+	{
+		try
+		{
+			formatter = new SimpleDateFormat(config.timestampFormat());
+		}
+		catch (IllegalArgumentException e)
+		{
+			formatter = new SimpleDateFormat("[HH:mm]");
+		}
 	}
 }

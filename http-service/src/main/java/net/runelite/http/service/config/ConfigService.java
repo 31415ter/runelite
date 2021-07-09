@@ -24,7 +24,13 @@
  */
 package net.runelite.http.service.config;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonSyntaxException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -32,6 +38,8 @@ import com.mongodb.client.MongoDatabase;
 import static com.mongodb.client.model.Filters.eq;
 import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
+import com.mongodb.client.model.UpdateOptions;
+import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.set;
 import static com.mongodb.client.model.Updates.unset;
 import java.util.ArrayList;
@@ -40,62 +48,34 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.http.api.RuneLiteAPI;
 import net.runelite.http.api.config.ConfigEntry;
 import net.runelite.http.api.config.Configuration;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.sql2o.Connection;
-import org.sql2o.Sql2o;
-import org.sql2o.Sql2oException;
 
 @Service
-@Slf4j
 public class ConfigService
 {
-	private static final String CREATE_CONFIG = "CREATE TABLE IF NOT EXISTS `config` (\n"
-		+ "  `user` int(11) NOT NULL,\n"
-		+ "  `key` tinytext NOT NULL,\n"
-		+ "  `value` text NOT NULL,\n"
-		+ "  UNIQUE KEY `user_key` (`user`,`key`(64))\n"
-		+ ") ENGINE=InnoDB;";
+	private static final int MAX_DEPTH = 8;
+	private static final int MAX_VALUE_LENGTH = 262144;
 
-	private static final String CONFIG_FK = "ALTER TABLE `config`\n"
-		+ "  ADD CONSTRAINT `user_fk` FOREIGN KEY (`user`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE;";
-
-	private final Sql2o sql2o;
 	private final Gson GSON = RuneLiteAPI.GSON;
+	private final UpdateOptions upsertUpdateOptions = new UpdateOptions().upsert(true);
 
 	private final MongoCollection<Document> mongoCollection;
 
 	@Autowired
 	public ConfigService(
-		@Qualifier("Runelite SQL2O") Sql2o sql2o,
-		MongoClient mongoClient
+		MongoClient mongoClient,
+		@Value("${mongo.database}") String databaseName
 	)
 	{
-		this.sql2o = sql2o;
 
-		try (Connection con = sql2o.open())
-		{
-			con.createQuery(CREATE_CONFIG)
-				.executeUpdate();
-
-			try
-			{
-				con.createQuery(CONFIG_FK)
-					.executeUpdate();
-			}
-			catch (Sql2oException ex)
-			{
-				// Ignore, happens when index already exists
-			}
-		}
-
-		MongoDatabase database = mongoClient.getDatabase("config");
+		MongoDatabase database = mongoClient.getDatabase(databaseName);
 		MongoCollection<Document> collection = database.getCollection("config");
 		this.mongoCollection = collection;
 
@@ -154,73 +134,110 @@ public class ConfigService
 		return new Configuration(config);
 	}
 
-	public void setKey(
+	public List<String> patch(int userID, Configuration config)
+	{
+		List<String> failures = new ArrayList<>();
+		List<Bson> sets = new ArrayList<>(config.getConfig().size());
+		for (ConfigEntry entry : config.getConfig())
+		{
+			Bson s = setForKV(entry.getKey(), entry.getValue());
+			if (s == null)
+			{
+				failures.add(entry.getKey());
+			}
+			else
+			{
+				sets.add(s);
+			}
+		}
+
+		if (sets.size() > 0)
+		{
+			mongoCollection.updateOne(
+				eq("_userId", userID),
+				combine(sets),
+				upsertUpdateOptions
+			);
+		}
+
+		return failures;
+	}
+
+	@Nullable
+	private Bson setForKV(String key, @Nullable String value)
+	{
+		if (key.startsWith("$") || key.startsWith("_"))
+		{
+			return null;
+		}
+
+		String[] split = key.split("\\.", 2);
+		if (split.length != 2)
+		{
+			return null;
+		}
+
+		String dbKey = split[0] + "." + split[1].replace('.', ':');
+
+		if (Strings.isNullOrEmpty(value))
+		{
+			return unset(dbKey);
+		}
+
+		if (!validateJson(value))
+		{
+			return null;
+		}
+
+		Object jsonValue = parseJsonString(value);
+		return set(dbKey, jsonValue);
+	}
+
+	public boolean setKey(
 		int userId,
 		String key,
 		@Nullable String value
 	)
 	{
-		try (Connection con = sql2o.open())
+		Bson set = setForKV(key, value);
+		if (set == null)
 		{
-			con.createQuery("insert into config (user, `key`, value) values (:user, :key, :value) on duplicate key update `key` = :key, value = :value")
-				.addParameter("user", userId)
-				.addParameter("key", key)
-				.addParameter("value", value != null ? value : "")
-				.executeUpdate();
+			return false;
 		}
 
-		if (key.startsWith("$") || key.startsWith("_"))
-		{
-			return;
-		}
-
-		String[] split = key.split("\\.", 2);
-		if (split.length != 2)
-		{
-			return;
-		}
-
-		Object jsonValue = parseJsonString(value);
 		mongoCollection.updateOne(eq("_userId", userId),
-			set(split[0] + "." + split[1].replace('.', ':'), jsonValue));
+			set,
+			upsertUpdateOptions);
+		return true;
 	}
 
-	public void unsetKey(
+	public boolean unsetKey(
 		int userId,
 		String key
 	)
 	{
-		try (Connection con = sql2o.open())
+		Bson set = setForKV(key, null);
+		if (set == null)
 		{
-			con.createQuery("delete from config where user = :user and `key` = :key")
-				.addParameter("user", userId)
-				.addParameter("key", key)
-				.executeUpdate();
+			return false;
 		}
 
-		if (key.startsWith("$") || key.startsWith("_"))
-		{
-			return;
-		}
-
-		String[] split = key.split("\\.", 2);
-		if (split.length != 2)
-		{
-			return;
-		}
-
-		mongoCollection.updateOne(eq("_userId", userId),
-			unset(split[0] + "." + split[1].replace('.', ':')));
+		mongoCollection.updateOne(eq("_userId", userId), set);
+		return true;
 	}
 
-	private static Object parseJsonString(String value)
+	@VisibleForTesting
+	static Object parseJsonString(String value)
 	{
 		Object jsonValue;
 		try
 		{
 			jsonValue = RuneLiteAPI.GSON.fromJson(value, Object.class);
-
-			if (jsonValue instanceof Double || jsonValue instanceof Float)
+			if (jsonValue == null)
+			{
+				return value;
+			}
+			else if (jsonValue instanceof Double || jsonValue instanceof Float)
 			{
 				Number number = (Number) jsonValue;
 				if (Math.floor(number.doubleValue()) == number.doubleValue() && !Double.isInfinite(number.doubleValue()))
@@ -249,5 +266,76 @@ public class ConfigService
 			jsonValue = value;
 		}
 		return jsonValue;
+	}
+
+	@VisibleForTesting
+	static boolean validateJson(String value)
+	{
+		try
+		{
+			// I couldn't figure out a better way to do this than a second json parse
+			JsonElement jsonElement = RuneLiteAPI.GSON.fromJson(value, JsonElement.class);
+			if (jsonElement == null)
+			{
+				return value.length() < MAX_VALUE_LENGTH;
+			}
+			return validateObject(jsonElement, 1);
+		}
+		catch (JsonSyntaxException ex)
+		{
+			// the client submits the string representation of objects which is not always valid json,
+			// eg. a value with a ':' in it. We just ignore it now. We can't json encode the values client
+			// side due to them already being strings, which prevents gson from being able to convert them
+			// to ints/floats/maps etc.
+			return value.length() < MAX_VALUE_LENGTH;
+		}
+	}
+
+	private static boolean validateObject(JsonElement jsonElement, int depth)
+	{
+		if (depth >= MAX_DEPTH)
+		{
+			return false;
+		}
+
+		if (jsonElement.isJsonObject())
+		{
+			JsonObject jsonObject = jsonElement.getAsJsonObject();
+
+			for (Map.Entry<String, JsonElement> entry : jsonObject.entrySet())
+			{
+				JsonElement element = entry.getValue();
+
+				if (!validateObject(element, depth + 1))
+				{
+					return false;
+				}
+			}
+		}
+		else if (jsonElement.isJsonArray())
+		{
+			JsonArray jsonArray = jsonElement.getAsJsonArray();
+
+			for (int i = 0; i < jsonArray.size(); ++i)
+			{
+				JsonElement element = jsonArray.get(i);
+
+				if (!validateObject(element, depth + 1))
+				{
+					return false;
+				}
+			}
+		}
+		else if (jsonElement.isJsonPrimitive())
+		{
+			JsonPrimitive jsonPrimitive = jsonElement.getAsJsonPrimitive();
+			String value = jsonPrimitive.getAsString();
+			if (value.length() >= MAX_VALUE_LENGTH)
+			{
+				return false;
+			}
+		}
+
+		return true;
 	}
 }

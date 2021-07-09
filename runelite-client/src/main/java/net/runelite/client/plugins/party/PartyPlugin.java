@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019, Tomas Slusny <slusnucky@gmail.com>
+ * Copyright (c) 2021, Jonathan Rousseau <https://github.com/JoRouss>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -24,10 +25,11 @@
  */
 package net.runelite.client.plugins.party;
 
+import com.google.common.base.Strings;
 import com.google.inject.Binder;
 import com.google.inject.Provides;
 import java.awt.Color;
-import java.awt.event.KeyEvent;
+import java.awt.image.BufferedImage;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -37,42 +39,54 @@ import java.util.Map;
 import java.util.UUID;
 import javax.annotation.Nullable;
 import javax.inject.Inject;
+import javax.inject.Named;
+import javax.swing.SwingUtilities;
 import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.KeyCode;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
+import net.runelite.api.Player;
 import net.runelite.api.Skill;
 import net.runelite.api.SoundEffectID;
 import net.runelite.api.Tile;
 import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.FocusChanged;
+import net.runelite.api.events.CommandExecuted;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.chat.ChatColorType;
 import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.discord.DiscordService;
+import net.runelite.client.discord.events.DiscordJoinRequest;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.OverlayMenuClicked;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.PartyChanged;
-import net.runelite.client.input.KeyListener;
-import net.runelite.client.input.KeyManager;
+import net.runelite.client.events.PartyMemberAvatar;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.party.data.PartyData;
 import net.runelite.client.plugins.party.data.PartyTilePingData;
+import net.runelite.client.plugins.party.messages.CharacterNameUpdate;
 import net.runelite.client.plugins.party.messages.LocationUpdate;
 import net.runelite.client.plugins.party.messages.SkillUpdate;
 import net.runelite.client.plugins.party.messages.TilePing;
 import net.runelite.client.task.Schedule;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
 import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
 import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
 import net.runelite.client.ws.PartyMember;
 import net.runelite.client.ws.PartyService;
 import net.runelite.client.ws.WSClient;
@@ -82,10 +96,11 @@ import net.runelite.http.api.ws.messages.party.UserSync;
 
 @PluginDescriptor(
 	name = "Party",
-	description = "Shows useful information about current party"
+	configName = "PartyPlugin2",
+	description = "Party management and basic info",
+	enabledByDefault = false
 )
-@Slf4j
-public class PartyPlugin extends Plugin implements KeyListener
+public class PartyPlugin extends Plugin
 {
 	@Inject
 	private Client client;
@@ -106,9 +121,6 @@ public class PartyPlugin extends Plugin implements KeyListener
 	private PartyPingOverlay partyPingOverlay;
 
 	@Inject
-	private KeyManager keyManager;
-
-	@Inject
 	private WSClient wsClient;
 
 	@Inject
@@ -120,14 +132,31 @@ public class PartyPlugin extends Plugin implements KeyListener
 	@Inject
 	private ChatMessageManager chatMessageManager;
 
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	private DiscordService discordService;
+
+	@Inject
+	@Named("developerMode")
+	boolean developerMode;
+
 	@Getter
 	private final Map<UUID, PartyData> partyDataMap = Collections.synchronizedMap(new HashMap<>());
 
 	@Getter
 	private final List<PartyTilePingData> pendingTilePings = Collections.synchronizedList(new ArrayList<>());
 
+	private PartyPanel panel;
+	private NavigationButton navButton;
+
 	private int lastHp, lastPray;
-	private boolean hotkeyDown, doSync;
+	private String lastCharacterName = "";
+	private WorldPoint lastLocation;
 	private boolean sendAlert;
 
 	@Override
@@ -139,18 +168,36 @@ public class PartyPlugin extends Plugin implements KeyListener
 	@Override
 	protected void startUp() throws Exception
 	{
+		panel = injector.getInstance(PartyPanel.class);
+
+		final BufferedImage icon = ImageUtil.loadImageResource(PartyPlugin.class, "panel_icon.png");
+
+		navButton = NavigationButton.builder()
+			.tooltip("Party")
+			.icon(icon)
+			.priority(9)
+			.panel(panel)
+			.build();
+
+		clientToolbar.addNavigation(navButton);
+
 		overlayManager.add(partyStatsOverlay);
 		overlayManager.add(partyPingOverlay);
 		wsClient.registerMessage(SkillUpdate.class);
 		wsClient.registerMessage(TilePing.class);
 		wsClient.registerMessage(LocationUpdate.class);
-		keyManager.registerKeyListener(this);
-		doSync = true; // Delay sync so eventbus can process correctly.
+		wsClient.registerMessage(CharacterNameUpdate.class);
+		// Delay sync so the eventbus can register prior to the sync response
+		SwingUtilities.invokeLater(this::requestSync);
 	}
 
 	@Override
 	protected void shutDown() throws Exception
 	{
+		clientToolbar.removeNavigation(navButton);
+
+		panel = null;
+
 		partyDataMap.clear();
 		pendingTilePings.clear();
 		worldMapManager.removeIf(PartyWorldMapPoint.class::isInstance);
@@ -159,10 +206,9 @@ public class PartyPlugin extends Plugin implements KeyListener
 		wsClient.unregisterMessage(SkillUpdate.class);
 		wsClient.unregisterMessage(TilePing.class);
 		wsClient.unregisterMessage(LocationUpdate.class);
-		keyManager.unregisterKeyListener(this);
-		hotkeyDown = false;
-		doSync = false;
+		wsClient.unregisterMessage(CharacterNameUpdate.class);
 		sendAlert = false;
+		lastLocation = null;
 	}
 
 	@Provides
@@ -178,29 +224,60 @@ public class PartyPlugin extends Plugin implements KeyListener
 			event.getEntry().getTarget().equals("Party") &&
 			event.getEntry().getOption().equals("Leave"))
 		{
-			party.changeParty(null);
+			leaveParty();
+		}
+	}
 
-			if (!config.messages())
+	void leaveParty()
+	{
+		party.changeParty(null);
+
+		if (!config.messages())
+		{
+			return;
+		}
+
+		final String leaveMessage = new ChatMessageBuilder()
+			.append(ChatColorType.HIGHLIGHT)
+			.append("You have left the party.")
+			.build();
+
+		chatMessageManager.queue(QueuedMessage.builder()
+			.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
+			.runeLiteFormattedMessage(leaveMessage)
+			.build());
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals(PartyConfig.GROUP))
+		{
+			final PartyMember localMember = party.getLocalMember();
+
+			if (localMember != null)
 			{
-				return;
+				if (config.includeSelf())
+				{
+					final PartyData partyData = getPartyData(localMember.getMemberId());
+					assert partyData != null;
+					SwingUtilities.invokeLater(() -> panel.addMember(partyData));
+				}
+				else
+				{
+					SwingUtilities.invokeLater(() -> panel.removeMember(localMember.getMemberId()));
+				}
 			}
 
-			final String leaveMessage = new ChatMessageBuilder()
-				.append(ChatColorType.HIGHLIGHT)
-				.append("You have left the party.")
-				.build();
-
-			chatMessageManager.queue(QueuedMessage.builder()
-				.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
-				.runeLiteFormattedMessage(leaveMessage)
-				.build());
+			// rebuild the panel in the event the "Recolor names" option changes
+			SwingUtilities.invokeLater(panel::updateAll);
 		}
 	}
 
 	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
-		if (!hotkeyDown || client.isMenuOpen() || party.getMembers().isEmpty() || !config.pings())
+		if (!client.isKeyPressed(KeyCode.KC_SHIFT) || client.isMenuOpen() || party.getMembers().isEmpty() || !config.pings())
 		{
 			return;
 		}
@@ -238,6 +315,35 @@ public class PartyPlugin extends Plugin implements KeyListener
 	}
 
 	@Subscribe
+	public void onDiscordJoinRequest(DiscordJoinRequest request)
+	{
+		final String requestMessage = new ChatMessageBuilder()
+			.append(ChatColorType.HIGHLIGHT)
+			.append("New join request received. Check your Party panel.")
+			.build();
+
+		chatMessageManager.queue(QueuedMessage.builder()
+			.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
+			.runeLiteFormattedMessage(requestMessage)
+			.build());
+
+		String userName = request.getUsername() + "#" + request.getDiscriminator();
+		SwingUtilities.invokeLater(() -> panel.addRequest(request.getUserId(), userName));
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		checkStateChanged(false);
+	}
+
+	public void replyToRequest(String userId, int reply)
+	{
+		discordService.respondToRequest(userId, reply);
+		panel.removeRequest(userId);
+	}
+
+	@Subscribe
 	public void onTilePing(TilePing event)
 	{
 		if (config.pings())
@@ -256,7 +362,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 				return;
 			}
 
-			client.playSoundEffect(SoundEffectID.SMITH_ANVIL_TINK);
+			clientThread.invoke(() -> client.playSoundEffect(SoundEffectID.SMITH_ANVIL_TINK));
 		}
 	}
 
@@ -278,7 +384,15 @@ public class PartyPlugin extends Plugin implements KeyListener
 			return;
 		}
 
-		final LocationUpdate locationUpdate = new LocationUpdate(client.getLocalPlayer().getWorldLocation());
+		WorldPoint location = client.getLocalPlayer().getWorldLocation();
+		if (location.equals(lastLocation))
+		{
+			return;
+		}
+
+		lastLocation = location;
+
+		final LocationUpdate locationUpdate = new LocationUpdate(location);
 		locationUpdate.setMemberId(localMember.getMemberId());
 		wsClient.send(locationUpdate);
 	}
@@ -292,41 +406,35 @@ public class PartyPlugin extends Plugin implements KeyListener
 			sendInstructionMessage();
 		}
 
-		if (doSync && !party.getMembers().isEmpty())
+		checkStateChanged(false);
+	}
+
+	void requestSync()
+	{
+		if (!party.getMembers().isEmpty())
 		{
 			// Request sync
 			final UserSync userSync = new UserSync();
 			userSync.setMemberId(party.getLocalMember().getMemberId());
 			ws.send(userSync);
 		}
+	}
 
-		doSync = false;
+	@Subscribe
+	public void onCharacterNameUpdate(final CharacterNameUpdate event)
+	{
+		final PartyData partyData = getPartyData(event.getMemberId());
 
-		final int currentHealth = client.getBoostedSkillLevel(Skill.HITPOINTS);
-		final int currentPrayer = client.getBoostedSkillLevel(Skill.PRAYER);
-		final int realHealth = client.getRealSkillLevel(Skill.HITPOINTS);
-		final int realPrayer = client.getRealSkillLevel(Skill.PRAYER);
-		final PartyMember localMember = party.getLocalMember();
-
-		if (localMember != null)
+		if (partyData == null)
 		{
-			if (currentHealth != lastHp)
-			{
-				final SkillUpdate update = new SkillUpdate(Skill.HITPOINTS, currentHealth, realHealth);
-				update.setMemberId(localMember.getMemberId());
-				ws.send(update);
-			}
-
-			if (currentPrayer != lastPray)
-			{
-				final SkillUpdate update = new SkillUpdate(Skill.PRAYER, currentPrayer, realPrayer);
-				update.setMemberId(localMember.getMemberId());
-				ws.send(update);
-			}
+			return;
 		}
 
-		lastHp = currentHealth;
-		lastPray = currentPrayer;
+		String name = event.getCharacterName();
+		name = Text.removeTags(Text.toJagexName(name));
+
+		partyData.setCharacterName(name);
+		SwingUtilities.invokeLater(() -> panel.updateMember(partyData.getMember().getMemberId()));
 	}
 
 	@Subscribe
@@ -349,6 +457,8 @@ public class PartyPlugin extends Plugin implements KeyListener
 			partyData.setPrayer(event.getValue());
 			partyData.setMaxPrayer(event.getMax());
 		}
+
+		SwingUtilities.invokeLater(() -> panel.updateMember(partyData.getMember().getMemberId()));
 	}
 
 	@Subscribe
@@ -376,7 +486,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 
 		final String joinMessage = new ChatMessageBuilder()
 			.append(ChatColorType.HIGHLIGHT)
-			.append(partyData.getName())
+			.append(partyData.getMember().getName())
 			.append(" has joined the party!")
 			.build();
 
@@ -387,7 +497,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 
 		final PartyMember localMember = party.getLocalMember();
 
-		if (localMember != null && partyData.getMemberId().equals(localMember.getMemberId()))
+		if (localMember != null && partyData.getMember().getMemberId().equals(localMember.getMemberId()))
 		{
 			sendAlert = true;
 		}
@@ -396,22 +506,48 @@ public class PartyPlugin extends Plugin implements KeyListener
 	@Subscribe
 	public void onUserSync(final UserSync event)
 	{
+		checkStateChanged(true);
+		lastLocation = null;
+	}
+
+	private void checkStateChanged(boolean forceSend)
+	{
 		final int currentHealth = client.getBoostedSkillLevel(Skill.HITPOINTS);
 		final int currentPrayer = client.getBoostedSkillLevel(Skill.PRAYER);
 		final int realHealth = client.getRealSkillLevel(Skill.HITPOINTS);
 		final int realPrayer = client.getRealSkillLevel(Skill.PRAYER);
 		final PartyMember localMember = party.getLocalMember();
 
+		final Player localPlayer = client.getLocalPlayer();
+		final String characterName = Strings.nullToEmpty(localPlayer != null && client.getGameState().getState() >= GameState.LOADING.getState() ? localPlayer.getName() : null);
+
 		if (localMember != null)
 		{
-			final SkillUpdate hpUpdate = new SkillUpdate(Skill.HITPOINTS, currentHealth, realHealth);
-			hpUpdate.setMemberId(localMember.getMemberId());
-			ws.send(hpUpdate);
+			if (forceSend || currentHealth != lastHp)
+			{
+				final SkillUpdate update = new SkillUpdate(Skill.HITPOINTS, currentHealth, realHealth);
+				update.setMemberId(localMember.getMemberId());
+				ws.send(update);
+			}
 
-			final SkillUpdate prayUpdate = new SkillUpdate(Skill.PRAYER, currentPrayer, realPrayer);
-			prayUpdate.setMemberId(localMember.getMemberId());
-			ws.send(prayUpdate);
+			if (forceSend || currentPrayer != lastPray)
+			{
+				final SkillUpdate update = new SkillUpdate(Skill.PRAYER, currentPrayer, realPrayer);
+				update.setMemberId(localMember.getMemberId());
+				ws.send(update);
+			}
+
+			if (forceSend || !characterName.equals(lastCharacterName))
+			{
+				final CharacterNameUpdate update = new CharacterNameUpdate(characterName);
+				update.setMemberId(localMember.getMemberId());
+				ws.send(update);
+			}
 		}
+
+		lastHp = currentHealth;
+		lastPray = currentPrayer;
+		lastCharacterName = characterName;
 	}
 
 	@Subscribe
@@ -425,7 +561,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 			{
 				final String joinMessage = new ChatMessageBuilder()
 					.append(ChatColorType.HIGHLIGHT)
-					.append(removed.getName())
+					.append(removed.getMember().getName())
 					.append(" has left the party!")
 					.build();
 
@@ -436,6 +572,8 @@ public class PartyPlugin extends Plugin implements KeyListener
 			}
 
 			worldMapManager.remove(removed.getWorldMapPoint());
+
+			SwingUtilities.invokeLater(() -> panel.removeMember(event.getMemberId()));
 		}
 	}
 
@@ -446,6 +584,35 @@ public class PartyPlugin extends Plugin implements KeyListener
 		partyDataMap.clear();
 		pendingTilePings.clear();
 		worldMapManager.removeIf(PartyWorldMapPoint.class::isInstance);
+
+		SwingUtilities.invokeLater(() ->
+		{
+			panel.removeAllMembers();
+			panel.removeAllRequests();
+		});
+	}
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted commandExecuted)
+	{
+		if (!developerMode || !commandExecuted.getCommand().equals("partyinfo"))
+		{
+			return;
+		}
+
+		chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value("Party " + party.getPartyId()).build());
+		chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value("Local Party " + party.getLocalPartyId()).build());
+		chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value("Local ID " + party.getLocalMember().getMemberId()).build());
+		for (PartyMember partyMember : party.getMembers())
+		{
+			chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value(" " + partyMember.getName() + " " + partyMember.getMemberId()).build());
+		}
+	}
+
+	@Subscribe
+	public void onPartyMemberAvatar(PartyMemberAvatar event)
+	{
+		SwingUtilities.invokeLater(() -> panel.updateMember(event.getMemberId()));
 	}
 
 	@Nullable
@@ -463,59 +630,40 @@ public class PartyPlugin extends Plugin implements KeyListener
 
 		return partyDataMap.computeIfAbsent(uuid, (u) ->
 		{
-			final String name = memberById.getName();
 			final WorldMapPoint worldMapPoint = new PartyWorldMapPoint(new WorldPoint(0, 0, 0), memberById);
-			worldMapPoint.setTooltip(name);
+			worldMapPoint.setTooltip(memberById.getName());
 
 			// When first joining a party, other members can join before getting a join for self
 			PartyMember partyMember = party.getLocalMember();
-			if (partyMember == null || !u.equals(partyMember.getMemberId()))
+
+			boolean isSelf = partyMember != null && u.equals(partyMember.getMemberId());
+
+			if (!isSelf)
 			{
 				worldMapManager.add(worldMapPoint);
 			}
 
-			return new PartyData(u, name, worldMapPoint, ColorUtil.fromObject(name));
+			PartyData partyData = new PartyData(memberById, worldMapPoint, ColorUtil.fromObject(memberById.getName()));
+			partyData.setShowOverlay(config.autoOverlay());
+
+			if (config.includeSelf() || !isSelf)
+			{
+				SwingUtilities.invokeLater(() -> panel.addMember(partyData));
+			}
+			else
+			{
+				SwingUtilities.invokeLater(panel::updateParty);
+			}
+
+			return partyData;
 		});
-	}
-
-	@Subscribe
-	public void onFocusChanged(FocusChanged event)
-	{
-		if (!event.isFocused())
-		{
-			hotkeyDown = false;
-		}
-	}
-
-	@Override
-	public void keyTyped(KeyEvent keyEvent)
-	{
-
-	}
-
-	@Override
-	public void keyPressed(KeyEvent keyEvent)
-	{
-		if (keyEvent.getKeyCode() == KeyEvent.VK_SHIFT)
-		{
-			hotkeyDown = true;
-		}
-	}
-
-	@Override
-	public void keyReleased(KeyEvent keyEvent)
-	{
-		if (keyEvent.getKeyCode() == KeyEvent.VK_SHIFT)
-		{
-			hotkeyDown = false;
-		}
 	}
 
 	private void sendInstructionMessage()
 	{
 		final String helpMessage = new ChatMessageBuilder()
 			.append(ChatColorType.HIGHLIGHT)
-			.append("To leave party hold SHIFT and right click party stats overlay.")
+			.append("To leave the party, click \"Leave party\" on the party panel.")
 			.build();
 
 		chatMessageManager.queue(QueuedMessage.builder()
